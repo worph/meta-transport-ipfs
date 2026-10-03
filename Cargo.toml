@@ -1,0 +1,68 @@
+[package]
+name = "meta-transport-ipfs"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+description = "MetaMesh transport plugin: IPFS tier for meta-share — libp2p (identify/kad/mdns/bitswap), nocopy filestore, bitswap ingress."
+
+[[bin]]
+name = "meta-transport-ipfs"
+path = "src/main.rs"
+
+# This repo IS the crate; the empty workspace table keeps it from being absorbed
+# into a parent workspace when checked out inside meta-root.
+[workspace]
+
+[dependencies]
+# The transport-plugin contract. Pinned by TAG, never by path — a path dep
+# resolves outside this repo, which is the Docker build context. See the
+# Dockerfile for building against an unreleased SDK.
+meta-feeder-sdk = { git = "https://github.com/worph/meta-feeder-sdk", tag = "v1.4.0", features = ["transport"] }
+
+# libp2p — transport only: identify (address exchange, load-bearing for bitswap
+# reachability), kad (DHT provider records), mdns (LAN discovery) + bitswap.
+# `rsa` is REQUIRED for public IPFS DHT interop (bootstrap.libp2p.io has RSA
+# identities). Must stay in lockstep with meta-gateway + meta-search.
+libp2p = { version = "0.56", features = ["tokio", "tcp", "yamux", "noise", "ping", "macros", "dns", "identify", "kad", "quic", "mdns", "rsa"] }
+
+tokio = { version = "1.40", features = ["full"] }
+axum = { version = "0.7", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The `MSR1` record-block shape, only to scrub legacy record blocks at boot.
+bincode = { version = "2", features = ["serde"] }
+futures = "0.3"
+async-trait = "0.1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+sha2 = "0.10"
+bytes = "1"
+tokio-util = { version = "0.7", features = ["io"] }
+
+# Bitswap stack. `beetswap 0.5` is the libp2p bitswap behaviour; the redb
+# blockstore persists under `<META_SHARE_DATA>/ipfs/blocks.redb`.
+beetswap = "0.5"
+blockstore = { version = "0.8", features = ["redb"] }
+cid = "0.11"
+redb = "2"
+# Lets beetswap's multihasher know sha3-256 (0x16) and sha2-512 (0x13); without
+# it every BLOCK keyed by a sha3 cid is rejected.
+multihash-codetable = { version = "0.1", features = ["sha2", "sha3"] }
+
+[dev-dependencies]
+tempfile = "3"
+meta-feeder-sdk = { git = "https://github.com/worph/meta-feeder-sdk", tag = "v1.4.0", features = ["testkit"] }
+
+# ---------------------------------------------------------------------------
+# Workaround for the yanked transitive `core2` (all versions). `multihash-
+# codetable 0.1.x` (via beetswap) needs `core2 = ^0.4.0`; commit `545e84b` is
+# the v0.4.0 release commit. Every libp2p-0.56 bitswap impl hits this. Mirror
+# any change in meta-gateway's Cargo.toml.
+# ---------------------------------------------------------------------------
+[patch.crates-io]
+core2 = { git = "https://github.com/bbqsrc/core2", rev = "545e84b" }
