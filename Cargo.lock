@@ -1964,8 +1964,8 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "meta-feeder-sdk"
-version = "1.6.0"
-source = "git+https://github.com/worph/meta-feeder-sdk?tag=v1.6.0#26beb2444bf8b4b33445c880940441756cc92729"
+version = "1.7.0"
+source = "git+https://github.com/worph/meta-feeder-sdk?tag=v1.7.0#027917c8cffe7ca43dadcf3b426cc5f69ecc443a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1990,7 +1990,7 @@ dependencies = [
 
 [[package]]
 name = "meta-transport-ipfs"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
