@@ -1,11 +1,9 @@
-//! The `network` section of the hull's `settings.json`, read-only.
+//! The hull's two endpoints this plugin needs: `peer_url` (announced in
+//! identify as `baseUrl=`) and `meta_core_url` (library byte reads).
 //!
-//! The hull owns the file (it seeds it from the deprecated env vars on first
-//! boot and edits it from the dashboard); this plugin only needs the two
-//! endpoints, and falls back to the same env-derived defaults the hull would
-//! seed when the file doesn't exist yet.
-
-use std::path::Path;
+//! `main` asks the hull (`GET /internal/network`) at boot; when it does not
+//! answer, [`NetworkSettings::from_env`] recomputes the same env-derived values
+//! the hull seeds its own settings from.
 
 use serde::Deserialize;
 use tracing::warn;
@@ -21,20 +19,6 @@ pub struct NetworkSettings {
 }
 
 impl NetworkSettings {
-    /// `<config_dir>/settings.json` → `network`, else [`Self::from_env`].
-    pub fn load(config_dir: &Path) -> Self {
-        #[derive(Deserialize, Default)]
-        #[serde(default)]
-        struct File {
-            network: Option<NetworkSettings>,
-        }
-        std::fs::read(config_dir.join("settings.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<File>(&b).ok())
-            .and_then(|f| f.network)
-            .unwrap_or_else(Self::from_env)
-    }
-
     /// The hull's first-boot seed, recomputed: `META_CORE_URL`, and
     /// `INTERNAL_BASE_URL` → `BASE_URL` → [`DEFAULT_PEER_URL`].
     pub fn from_env() -> Self {
@@ -63,22 +47,21 @@ fn env_nonempty(key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+impl From<meta_feeder_sdk::transport::NetworkInfo> for NetworkSettings {
+    fn from(n: meta_feeder_sdk::transport::NetworkInfo) -> Self {
+        Self {
+            meta_core_url: n.meta_core_url,
+            peer_url: n.peer_url,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn reads_the_network_section_of_the_hulls_file() {
-        let d = std::env::temp_dir().join(format!("ipfs-settings-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(
-            d.join("settings.json"),
-            r#"{"network":{"meta_core_url":"http://mc:9000","peer_url":"https://share.example"},"usenet":{"nntp_host":"x"}}"#,
-        )
-        .unwrap();
-        let n = NetworkSettings::load(&d);
-        assert_eq!(n.meta_core_url.as_deref(), Some("http://mc:9000"));
-        assert_eq!(n.peer_url.as_deref(), Some("https://share.example"));
-        let _ = std::fs::remove_dir_all(&d);
+    fn the_env_fallback_always_has_a_peer_url() {
+        assert!(NetworkSettings::from_env().peer_url.is_some());
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "meta-transport-ipfs"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -19,7 +19,7 @@ path = "src/main.rs"
 # The transport-plugin contract. Pinned by TAG, never by path — a path dep
 # resolves outside this repo, which is the Docker build context. See the
 # Dockerfile for building against an unreleased SDK.
-meta-feeder-sdk = { git = "https://github.com/worph/meta-feeder-sdk", tag = "v1.4.0", features = ["transport"] }
+meta-feeder-sdk = { git = "https://github.com/worph/meta-feeder-sdk", tag = "v1.5.0", features = ["transport"] }
 
 # libp2p — transport only: identify (address exchange, load-bearing for bitswap
 # reachability), kad (DHT provider records), mdns (LAN discovery) + bitswap.
@@ -56,7 +56,7 @@ multihash-codetable = { version = "0.1", features = ["sha2", "sha3"] }
 
 [dev-dependencies]
 tempfile = "3"
-meta-feeder-sdk = { git = "https://github.com/worph/meta-feeder-sdk", tag = "v1.4.0", features = ["testkit"] }
+meta-feeder-sdk = { git = "https://github.com/worph/meta-feeder-sdk", tag = "v1.5.0", features = ["testkit"] }
 
 # ---------------------------------------------------------------------------
 # Workaround for the yanked transitive `core2` (all versions). `multihash-

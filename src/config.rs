@@ -268,7 +268,10 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_env() -> Result<Self> {
+    /// `net`: the hull's endpoints (`GET /internal/network`), or
+    /// [`NetworkSettings::from_env`](crate::settings::NetworkSettings::from_env)
+    /// when the hull did not answer.
+    pub fn from_env(net: crate::settings::NetworkSettings) -> Result<Self> {
         // Reachability posture first — the listen addr, the kad bootstrap
         // list, and whether we publish provider records all fall out of it.
         // `P2P_ANNOUNCE` is the deprecated spelling of `PUBLIC_ADDR`.
@@ -323,13 +326,7 @@ impl Config {
             )),
         };
 
-        // The network endpoints are the hull's settings (`settings.json`,
-        // seeded once from env by the hull). Read-only here; env fallback when
-        // the file doesn't exist yet.
-        let config_dir: PathBuf = std::env::var("META_SHARE_CONFIG_DIR")
-            .unwrap_or_else(|_| "/config".to_string())
-            .into();
-        let net = crate::settings::NetworkSettings::load(&config_dir);
+        // The network endpoints are the hull's settings, handed in by `main`.
         let peer_api_url = net
             .peer_url
             .as_deref()

@@ -23,11 +23,20 @@ meta-share's variables, unchanged: `P2P_LISTEN`, `PUBLIC_ADDR`, `KAD_*`,
 `META_SHARE_BLOCKSTORE_CACHE_MB`, `META_SHARE_INGRESS_*`,
 `META_SHARE_LOOSE_BLOCK_MAX_BYTES`, `META_SHARE_LOCAL_FILES_PATH`,
 `META_SHARE_FILES_PATH`, `META_SHARE_SEED_DHT_PROVIDE`, `META_SHARE_DATA`, plus
-`META_SHARE_HULL_URL`. `meta_core_url` / `peer_url` come from the hull's
-`settings.json` (mount `/config` read-only), env as the first-boot fallback.
+`META_SHARE_HULL_URL`. `meta_core_url` / `peer_url` are asked from the hull at
+boot (`GET /internal/network`), env as the fallback.
 
-Start it **after** the hull is healthy: the hull migrates its material index out
-of `ipfs/blocks.redb` on its first boot after the split (redb is single-process).
+**Own settings** (config plane, `META_SHARE_PLUGIN_STATE_DIR`, default `/state` →
+`config.json`): cohort namespace, DHT/pinned bootstrap peers, mDNS, DHT announce,
+max connections, background completion. Edited from meta-share's dashboard
+(Plugins → ipfs → configure); `config.json` wins and is written onto the env names
+above at boot, so env only seeds it. Saving restarts the plugin. `PUBLIC_ADDR` /
+`P2P_LISTEN` stay env-only (they follow the published port and the box's IP).
+
+Boot order is handled here, not by compose: before opening `ipfs/blocks.redb` the
+plugin waits (≤ 60 s) for the hull's `/health`, because the hull migrates its
+material index out of that file on its first boot after the split and redb is
+single-process.
 
 ## Build
 

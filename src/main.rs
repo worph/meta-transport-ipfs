@@ -6,9 +6,12 @@
 //! `cache/`. Serves the transport contract on `HTTP_LISTEN` (internal only) and
 //! the public `/ipfs/:cid` gateway, which the hull relays.
 //!
-//! The swarm announces the **hull's** URL in identify (`baseUrl=`, from the
-//! hull's `settings.json`), so peers and gateways keep calling meta-share's
-//! public API exactly as before — the plugin is invisible on the wire.
+//! The swarm announces the **hull's** URL in identify (`baseUrl=`, asked from the
+//! hull at boot), so peers and gateways keep calling meta-share's public API
+//! exactly as before — the plugin is invisible on the wire.
+//!
+//! Own settings: [`plane`] (`<state dir>/config.json`, edited from meta-share's
+//! dashboard), overlaid onto the env names the modules read.
 
 mod api;
 mod blockstore;
@@ -19,6 +22,7 @@ mod ingress;
 mod ingress_commit;
 mod ipfs_chunk;
 mod material;
+mod plane;
 mod plugin;
 mod settings;
 mod share;
@@ -35,7 +39,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use libp2p::identity;
-use meta_feeder_sdk::transport::{serve_transport, FocusView, HullClient};
+use meta_feeder_sdk::transport::config::state_dir_from_env;
+use meta_feeder_sdk::transport::{serve_transport, ConfigPlane, FocusView, HullClient};
 use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -46,7 +51,35 @@ async fn main() -> Result<()> {
     });
     tracing_subscriber::fmt().with_env_filter(filter).with_target(false).init();
 
-    let cfg = config::Config::from_env()?;
+    // Own settings first: `config.json` wins over the env it was seeded from,
+    // written onto the env names every module reads — before any of them does.
+    let plane = Arc::new(ConfigPlane::new(plane::schema(), &state_dir_from_env(), plane::seed()));
+    plane::overlay_env(&plane.effective());
+
+    let http = reqwest::Client::builder()
+        .user_agent(concat!("meta-transport-ipfs/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("build shared reqwest client")?;
+    let hull = HullClient::from_env(http.clone());
+
+    // Wait for the hull before opening `ipfs/blocks.redb`: on its first boot
+    // after the split it migrates the material index out of that file, and redb
+    // is single-process. Compose `depends_on` used to order this; separate
+    // store apps cannot. Bounded — a hull that stays down must not wedge us.
+    if hull.is_enabled() && !hull.wait_ready(std::time::Duration::from_secs(60)).await {
+        warn!("meta-share (hull) did not answer within 60s; starting anyway");
+    }
+    let net = match hull.network().await {
+        Ok(Some(n)) => settings::NetworkSettings::from(n),
+        Ok(None) => settings::NetworkSettings::from_env(),
+        Err(e) => {
+            warn!(error = %e, "could not ask the hull for its endpoints; using env");
+            settings::NetworkSettings::from_env()
+        }
+    };
+
+    let cfg = config::Config::from_env(net)?;
     let keypair = identity::Keypair::generate_ed25519();
     let local_peer_id = libp2p::PeerId::from(keypair.public());
     let agent_version = swarm::build_agent_version(cfg.peer_api_url.as_deref());
@@ -61,17 +94,13 @@ async fn main() -> Result<()> {
         kad_provide_enabled = cfg.kad.provide_enabled,
         seed_dht_provide = cfg.seed_dht_provide,
         agent_version = %agent_version,
+        config = %plane.path().display(),
         "starting meta-transport-ipfs"
     );
 
     let raw_block_store = blockstore::open_redb_blockstore(&cfg.data_dir)
         .await
         .context("open ipfs blockstore")?;
-    let http = reqwest::Client::builder()
-        .user_agent(concat!("meta-transport-ipfs/", env!("CARGO_PKG_VERSION")))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .context("build shared reqwest client")?;
     let webdav_url_cache = Arc::new(tokio::sync::OnceCell::new());
     let redb_handle = raw_block_store.raw_db();
     let ingress = Arc::new(ingress::IngressRegistry::from_data_dir(&cfg.data_dir));
@@ -132,7 +161,7 @@ async fn main() -> Result<()> {
         peer_directory,
         focus,
         http: http.clone(),
-        hull: HullClient::from_env(http),
+        hull,
         data_dir: cfg.data_dir.clone(),
         meta_core_url: cfg.meta_core_url.clone(),
         webdav_url_cache,
@@ -149,5 +178,5 @@ async fn main() -> Result<()> {
     }
     ingress_commit::spawn(Arc::clone(&state));
 
-    serve_transport(Arc::new(plugin::IpfsPlugin { state }), cfg.http_addr).await
+    serve_transport(Arc::new(plugin::IpfsPlugin { state, config: plane }), cfg.http_addr).await
 }

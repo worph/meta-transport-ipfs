@@ -44,8 +44,8 @@ COPY --from=builder /meta-transport-ipfs /usr/local/bin/meta-transport-ipfs
 
 # Same uid as meta-share: the plugins share its /data volume.
 RUN useradd --system --uid 10001 --no-create-home metashare \
-    && mkdir -p /data/meta-share \
-    && chown metashare:metashare /data/meta-share
+    && mkdir -p /data/meta-share /state \
+    && chown metashare:metashare /data/meta-share /state
 USER metashare
 WORKDIR /data/meta-share
 
@@ -57,7 +57,7 @@ EXPOSE 3000 4001
 ENV HTTP_LISTEN=0.0.0.0:3000 \
     P2P_LISTEN=/ip4/0.0.0.0/tcp/4001 \
     META_SHARE_DATA=/data/meta-share \
-    META_SHARE_CONFIG_DIR=/config \
+    META_SHARE_PLUGIN_STATE_DIR=/state \
     RUST_LOG=info,meta_transport_ipfs=info,libp2p=warn,beetswap=warn,yamux=warn
 
 ENTRYPOINT ["/usr/local/bin/meta-transport-ipfs"]

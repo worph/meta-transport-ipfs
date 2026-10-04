@@ -17,11 +17,11 @@ use meta_feeder_sdk::transport::ipfs::{
     RelPath, ShareContainer, ShareLibrary, Shared,
 };
 use meta_feeder_sdk::transport::{
-    ApiError, Capabilities, Deleted, FocusView, Health, Job, Lane, Manifest, ReconcileReport,
+    ApiError, Capabilities, ConfigPlane, Deleted, FocusView, Health, Job, Lane, Manifest, ReconcileReport,
     ReconcileRequest, TransportPlugin, CONTRACT_VERSION,
 };
 use serde::Deserialize;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::api::files::{bitswap, bytes_to_response, PLAYER_HEADER};
 use crate::api::AppState;
@@ -34,6 +34,7 @@ const IMPORT_BODY_LIMIT: usize = 600 * 1024 * 1024;
 
 pub struct IpfsPlugin {
     pub state: Arc<AppState>,
+    pub config: Arc<ConfigPlane>,
 }
 
 fn lane_of(headers: &HeaderMap) -> Lane {
@@ -53,6 +54,7 @@ impl TransportPlugin for IpfsPlugin {
             version: env!("CARGO_PKG_VERSION").into(),
             contract: CONTRACT_VERSION,
             capabilities: Capabilities { fetch: true, share: true },
+            config: true,
         }
     }
 
@@ -110,6 +112,10 @@ impl TransportPlugin for IpfsPlugin {
         &self.state.focus
     }
 
+    fn config(&self) -> Option<Arc<ConfigPlane>> {
+        Some(Arc::clone(&self.config))
+    }
+
     fn extra_routes(self: Arc<Self>) -> Router {
         let gateway = Router::new()
             .route("/ipfs/:cid", get(crate::api::ipfs_gateway::get_ipfs))
@@ -144,6 +150,7 @@ impl TransportPlugin for IpfsPlugin {
             .route("/ipfs-tier/share/container", post(share_container))
             .route("/ipfs-tier/stats/blockstore", get(blockstore_stats))
             .route("/ipfs-tier/debug/:cid", get(debug_block))
+            .route("/ipfs-tier/restart", post(restart))
             .with_state(self)
             .merge(gateway)
     }
@@ -421,4 +428,16 @@ async fn debug_block(State(p): S, Path(cid): Path<String>) -> Response {
 #[allow(dead_code)]
 pub fn bytes_response(bytes: Vec<u8>, range: Option<&HeaderValue>) -> Response {
     bytes_to_response(bytes, range)
+}
+
+/// The hull changed the endpoints this plugin announces (`peer_url`) or reads
+/// through (`meta_core_url`): exit so `restart: unless-stopped` re-execs us and
+/// `main` asks the hull again.
+async fn restart() -> StatusCode {
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        warn!("restarting to pick up the hull's new network settings");
+        std::process::exit(0);
+    });
+    StatusCode::NO_CONTENT
 }
