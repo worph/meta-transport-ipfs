@@ -9,6 +9,7 @@
 //! locals (not held on `self`) so each handler method can borrow
 //! `&mut self` cleanly without conflicting with the arm futures.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -25,9 +26,44 @@ use crate::gateway_discovery::{advertises_gateways, fetch_gateway_caps};
 use super::bootstrap::{addr_targets_match, redial_bootstrap, BootstrapEntry};
 use super::bitswap_client::BitswapInflight;
 use super::identify_agent::parse_base_url;
-use super::kad_discovery::{namespace_key, peer_id_from_multiaddr, KadConfig};
+use super::kad_discovery::{is_dialable_addr, namespace_key, peer_id_from_multiaddr, KadConfig};
 use super::peer_directory::PeerDirectory;
 use super::{Behaviour, BehaviourEvent, Command, GatewayCapsConfig, PeersInfo};
+
+/// How often [`SwarmTask::on_gateway_keepalive_tick`] re-dials dropped
+/// gateways and re-stamps live ones. Half meta-search's 60 s: an NZB play is
+/// blocked for as long as the gateway is missing (no one else can redeem).
+const GATEWAY_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// A gateway we've identified and now pin for keep-alive: its API base URL (for
+/// the periodic caps refresh that keeps it routable) plus dialable addresses
+/// (for re-pinning the connection if it drops). Persists across TTL expiry and
+/// disconnect — unlike the read-side directory entry, which `forget_peer` drops
+/// on the last close — so a gateway is never permanently forgotten once seen.
+///
+/// Ported from meta-search. Without it a gateway that restarts under the same
+/// peer id is lost for good: its mDNS record never expires, so `Discovered`
+/// never fires again, and the gateway itself never dials consumers
+/// (watch.nsl.sh 2026-10-04: every NZB answered "no gateway can redeem it"
+/// until this container was restarted).
+#[derive(Clone, Debug, PartialEq)]
+struct GatewayPin {
+    base_url: Option<String>,
+    addrs: Vec<Multiaddr>,
+}
+
+/// The pin an identify from a gateway yields, or `None` for any other peer.
+/// Only dialable addresses are kept: a pin is retried for the life of the
+/// process, so a loopback / unspecified listener would be a permanent cost.
+fn gateway_pin(agent_version: &str, listen_addrs: &[Multiaddr], base_url: Option<String>) -> Option<GatewayPin> {
+    if !advertises_gateways(agent_version) {
+        return None;
+    }
+    Some(GatewayPin {
+        base_url,
+        addrs: listen_addrs.iter().filter(|a| is_dialable_addr(a)).cloned().collect(),
+    })
+}
 
 /// All the state that lives across iterations of the event loop. `swarm`
 /// and the channel receivers stay as locals in [`SwarmTask::run`] so the
@@ -63,6 +99,9 @@ pub(super) struct SwarmTask {
     http: reqwest::Client,
     /// Timeout + debounce for that fetch.
     gateway_caps: GatewayCapsConfig,
+    /// Gateways kept connected + routable by the keep-alive tick. See
+    /// [`GatewayPin`].
+    pinned_gateways: HashMap<PeerId, GatewayPin>,
 }
 
 impl SwarmTask {
@@ -101,6 +140,7 @@ impl SwarmTask {
             bitswap_inflight: BitswapInflight::new(),
             http,
             gateway_caps,
+            pinned_gateways: HashMap::new(),
         }
     }
 
@@ -176,6 +216,11 @@ impl SwarmTask {
         let mut kad_discovery_tick = tokio::time::interval(self.kad_discovery_interval);
         kad_discovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // Keep known gateways connected + routable (re-dial dropped ones,
+        // re-fetch caps on live ones). See [`GatewayPin`].
+        let mut gateway_keepalive_tick = tokio::time::interval(GATEWAY_KEEPALIVE_INTERVAL);
+        gateway_keepalive_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 cmd = rx.recv() => match cmd {
@@ -205,6 +250,9 @@ impl SwarmTask {
                 },
                 _ = kad_discovery_tick.tick() => {
                     self.on_kad_discovery_tick(&mut swarm, &mut kad_discovery_tick);
+                },
+                _ = gateway_keepalive_tick.tick() => {
+                    self.on_gateway_keepalive_tick(&mut swarm);
                 },
                 event = swarm.select_next_some() => {
                     self.on_swarm_event(&mut swarm, event, &mut kad_discovery_tick).await;
@@ -292,6 +340,71 @@ impl SwarmTask {
 
     /// Top-level swarm-event dispatch. Each branch inspects `&event` and
     /// falls through to `default_log` at the end.
+    /// Keep pinned gateways connected + routable (ported from meta-search):
+    ///
+    /// 1. **Connection drop** — re-dial a pinned gateway that isn't connected,
+    ///    directly (not through the mDNS / kad-provider dial-gates), re-seeding
+    ///    its addresses into kad first in case they were evicted. The redial
+    ///    triggers identify, which restores its base URL and redeem claims.
+    /// 2. **Directory staleness** — identify goes quiet on an idle connection,
+    ///    so the 600 s gateway TTL can lapse on a live peer. Re-fetch caps
+    ///    over HTTP to re-stamp it.
+    fn on_gateway_keepalive_tick(&mut self, swarm: &mut Swarm<Behaviour>) {
+        // Small, stable set — clone to sidestep the self/swarm borrow overlap.
+        for (pid, pin) in self.pinned_gateways.clone() {
+            if swarm.is_connected(&pid) {
+                if self
+                    .peer_directory
+                    .needs_cap_refresh(&pid, self.gateway_caps.refresh_after)
+                {
+                    if let Some(base_url) = pin.base_url {
+                        self.spawn_caps_fetch(pid, base_url);
+                    }
+                }
+            } else if pin.addrs.is_empty() {
+                // Every address it announced was undialable — most likely a
+                // gateway without PUBLIC_ADDR seen only over a relay. A dial
+                // would fail every tick for the life of the process.
+                trace!(peer_id = %pid,
+                    "gateway keep-alive: no dialable address for pinned gateway; skipping re-dial");
+            } else {
+                for addr in &pin.addrs {
+                    swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
+                }
+                match swarm.dial(pid) {
+                    Ok(()) => debug!(peer_id = %pid,
+                        "gateway keep-alive: re-dialing dropped gateway"),
+                    Err(e) => debug!(peer_id = %pid, error = %e,
+                        "gateway keep-alive: re-dial failed"),
+                }
+            }
+        }
+    }
+
+    /// Fetch a gateway's capabilities over HTTP off its `base_url` and record
+    /// them in the directory. Fire-and-forget: a slow/dead gateway must not
+    /// stall the swarm loop; a failure keeps whatever was held (it ages out on
+    /// its own TTL) and is retried on the next identify / keep-alive tick.
+    fn spawn_caps_fetch(&self, pid: PeerId, base_url: String) {
+        let http = self.http.clone();
+        let dir = self.peer_directory.clone();
+        let timeout = self.gateway_caps.fetch_timeout;
+        tokio::spawn(async move {
+            match fetch_gateway_caps(&http, &base_url, timeout).await {
+                Ok(caps) => {
+                    let redeems = caps.redeem_claims();
+                    debug!(peer_id = %pid, base_url = %base_url,
+                        nzb_fetch = caps.nzb_fetch,
+                        redeem_claims = redeems.len(),
+                        "gateway caps: fetched");
+                    dir.record_gateway_caps(pid, caps.nzb_fetch, redeems);
+                }
+                Err(e) => debug!(peer_id = %pid, base_url = %base_url,
+                    error = %e, "gateway caps: fetch failed"),
+            }
+        });
+    }
+
     async fn on_swarm_event(
         &mut self,
         swarm: &mut Swarm<Behaviour>,
@@ -371,15 +484,26 @@ impl SwarmTask {
             identify::Event::Received { peer_id, info, .. }
         )) = &event {
             let pid = *peer_id;
-            let addrs: Vec<Multiaddr> = info.listen_addrs.clone();
-            for addr in addrs {
-                swarm.behaviour_mut().kad.add_address(&pid, addr);
+            // Only what a remote peer could actually dial: a container behind
+            // docker's bridge reports 0.0.0.0 / 127.0.0.1 listeners too, and
+            // the keep-alive below would retry a pinned bad address forever.
+            for addr in info.listen_addrs.iter().filter(|a| is_dialable_addr(a)) {
+                swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
             }
             let base_url = parse_base_url(&info.agent_version).map(str::to_string);
             let update = self.peer_directory.upsert_from_identify(pid, base_url);
             if let Some(url) = &update.base_url_changed {
                 debug!(peer_id = %pid, base_url = %url,
                     "identify: learned/refreshed peer base URL");
+            }
+            // Pin every identified gateway for the keep-alive tick, refreshing
+            // its addresses each time, so a dropped gateway gets re-dialed.
+            if let Some(pin) = gateway_pin(
+                &info.agent_version,
+                &info.listen_addrs,
+                self.peer_directory.base_url(&pid),
+            ) {
+                self.pinned_gateways.insert(pid, pin);
             }
             // Gateway discovery. A non-empty `gateways=` token is emitted by
             // meta-gateway and nobody else, so it's the "this peer is a
@@ -389,36 +513,16 @@ impl SwarmTask {
             // plain HTTP off the just-learned baseUrl instead (the reliable
             // source that replaced the flaky gossipsub heartbeat).
             //
-            // Fire-and-forget: a slow/dead gateway must not stall the swarm
-            // loop. Debounced by the directory so the identify burst on a
-            // multi-connection peer doesn't fan out into redundant fetches;
-            // identify's ~5min re-announce then keeps the capability fresh
-            // inside its 600s TTL, which is why there's no keep-alive tick.
+            // Debounced by the directory so the identify burst on a
+            // multi-connection peer doesn't fan out into redundant fetches.
+            // The keep-alive tick re-stamps it when identify goes quiet.
             if advertises_gateways(&info.agent_version)
                 && self
                     .peer_directory
                     .needs_cap_refresh(&pid, self.gateway_caps.refresh_after)
             {
                 if let Some(base_url) = self.peer_directory.base_url(&pid) {
-                    let http = self.http.clone();
-                    let dir = self.peer_directory.clone();
-                    let timeout = self.gateway_caps.fetch_timeout;
-                    tokio::spawn(async move {
-                        match fetch_gateway_caps(&http, &base_url, timeout).await {
-                            Ok(caps) => {
-                                let redeems = caps.redeem_claims();
-                                debug!(peer_id = %pid, base_url = %base_url,
-                                    nzb_fetch = caps.nzb_fetch,
-                                    redeem_claims = redeems.len(),
-                                    "gateway caps: fetched");
-                                dir.record_gateway_caps(pid, caps.nzb_fetch, redeems);
-                            }
-                            // Best-effort: keep whatever we held (it ages out on
-                            // its own TTL) and retry on the next identify.
-                            Err(e) => debug!(peer_id = %pid, base_url = %base_url,
-                                error = %e, "gateway caps: fetch failed"),
-                        }
-                    });
+                    self.spawn_caps_fetch(pid, base_url);
                 }
             }
         }
@@ -554,5 +658,39 @@ fn default_log(event: SwarmEvent<BehaviourEvent>) {
             trace!(peer_count = peers.len(), "mdns: expired local peers");
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ma(s: &str) -> Multiaddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn only_a_gateway_is_pinned() {
+        let addrs = [ma("/ip4/172.18.0.16/tcp/4002")];
+        assert_eq!(gateway_pin("meta-share/2.3.0 baseUrl=http://x:3000", &addrs, None), None);
+        assert!(gateway_pin("meta-gateway/1.0.41 gateways=usenet,tmdb", &addrs, None).is_some());
+    }
+
+    #[test]
+    fn a_pin_keeps_only_dialable_addresses() {
+        let addrs = [
+            ma("/ip4/127.0.0.1/tcp/4002"),
+            ma("/ip4/0.0.0.0/tcp/4002"),
+            ma("/ip4/172.18.0.16/tcp/4002"),
+            ma("/ip4/85.17.246.67/tcp/4002"),
+        ];
+        let pin = gateway_pin(
+            "meta-gateway/1.0.41 gateways=usenet",
+            &addrs,
+            Some("https://metagateway-watch.nsl.sh".into()),
+        )
+        .unwrap();
+        assert_eq!(pin.addrs, vec![addrs[2].clone(), addrs[3].clone()]);
+        assert_eq!(pin.base_url.as_deref(), Some("https://metagateway-watch.nsl.sh"));
     }
 }
