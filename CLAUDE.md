@@ -7,6 +7,11 @@ Behaviour must stay identical to the monolith's swarm / blockstore / ingress.
 
 1. **The swarm is transport-only**: identify/kad/mdns/bitswap. No kamilata, no
    gossipsub, no request_response — search is meta-search's.
+   Resolving a **pointer** (`GET /ipfs-tier/resolve/:cid`, `resolve.rs`) is not a
+   swarm protocol: it redeems over plain HTTP at a gateway's base URL, chosen by
+   `gateways.rs` from the config-pinned local gateways plus the swarm directory,
+   fastest first. Never move it onto libp2p, and never let bitswap answer a
+   pointer — its multihash is `identity`, there is nothing to verify.
 2. **`MAX_MULTIHASH_SIZE = 64`** must match meta-gateway and meta-search.
 3. **`core2` is patched** in `Cargo.toml` (every libp2p-0.56 bitswap impl needs
    the yanked `^0.4.0`); mirror changes in meta-gateway.

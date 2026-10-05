@@ -38,6 +38,8 @@ pub struct AppState {
     /// default = public mode). Decided here, where `PUBLIC_ADDR` is known; the
     /// hull always asks and this gates.
     pub seed_dht_provide: bool,
+    /// Gateways that can redeem pointers, fastest first (`/ipfs-tier/resolve`).
+    pub gateways: Arc<crate::gateways::Gateways>,
 }
 
 /// "This peer now seeds `cid`" — the hull writes the seed row (and decides on

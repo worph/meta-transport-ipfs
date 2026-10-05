@@ -119,6 +119,7 @@ impl TransportPlugin for IpfsPlugin {
     fn extra_routes(self: Arc<Self>) -> Router {
         let gateway = Router::new()
             .route("/ipfs/:cid", get(crate::api::ipfs_gateway::get_ipfs))
+            .route("/ipfs-tier/resolve/:cid", get(crate::resolve::resolve))
             .with_state(Arc::clone(&self.state));
         Router::new()
             .route("/ipfs-tier/peers", get(peers))
@@ -216,26 +217,28 @@ async fn cat(State(p): S, Path(cid): Path<String>, Query(q): Query<CatQuery>) ->
         Err(e) => return bad_cid(e),
     };
     let max = q.max.unwrap_or_else(crate::api::ipfs_walker::max_body_bytes);
-    let block = match crate::api::ipfs_walker::get_block(&p.state, &mscid, Lane::Focused).await {
-        Ok(b) => b,
-        Err(e) => return ApiError::Upstream(format!("{e:#}")).into_response(),
-    };
-    let bytes = if mscid.codec() == crate::api::ipfs_walker::DAGPB_CODEC {
-        match crate::api::ipfs_walker::assemble_dagpb_file(&p.state, &block, max, Lane::Focused).await {
-            Ok(b) => b,
-            Err(e) => return ApiError::Upstream(format!("{e:#}")).into_response(),
-        }
-    } else {
-        if block.len() > max {
-            return ApiError::Upstream(format!(
-                "{cid} is {} bytes, over the {max}-byte ceiling",
-                block.len()
-            ))
-            .into_response();
-        }
-        block
-    };
-    (StatusCode::OK, bytes).into_response()
+    match read_object(&p.state, &mscid, max).await {
+        Ok(bytes) => (StatusCode::OK, bytes).into_response(),
+        Err(e) => ApiError::Upstream(format!("{e:#}")).into_response(),
+    }
+}
+
+/// A block, or a dag-pb file assembled, up to `max` bytes — local, else bitswap.
+pub(crate) async fn read_object(
+    state: &AppState,
+    mscid: &crate::blockstore::MsCid,
+    max: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let block = crate::api::ipfs_walker::get_block(state, mscid, Lane::Focused).await?;
+    if mscid.codec() == crate::api::ipfs_walker::DAGPB_CODEC {
+        return crate::api::ipfs_walker::assemble_dagpb_file(state, &block, max, Lane::Focused).await;
+    }
+    anyhow::ensure!(
+        block.len() <= max,
+        "{mscid} is {} bytes, over the {max}-byte ceiling",
+        block.len()
+    );
+    Ok(block)
 }
 
 #[derive(Deserialize)]

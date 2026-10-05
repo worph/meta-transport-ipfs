@@ -18,12 +18,14 @@ mod blockstore;
 mod config;
 mod filestore;
 mod gateway_discovery;
+mod gateways;
 mod ingress;
 mod ingress_commit;
 mod ipfs_chunk;
 mod material;
 mod plane;
 mod plugin;
+mod resolve;
 mod settings;
 mod share;
 mod store;
@@ -166,7 +168,9 @@ async fn main() -> Result<()> {
         meta_core_url: cfg.meta_core_url.clone(),
         webdav_url_cache,
         seed_dht_provide: cfg.seed_dht_provide,
+        gateways: Arc::new(gateways::Gateways::from_env()),
     });
+    gateways::spawn_refresh(Arc::clone(&state));
 
     // Bitswap ingress: sweep partial fetches a previous process left in `tmp/`,
     // then promote/fill on a timer.

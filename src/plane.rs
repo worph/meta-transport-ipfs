@@ -24,6 +24,8 @@ pub fn schema() -> ConfigSchema {
                 .with_help("Multiaddrs used to join the public IPFS DHT. Empty = the app's default list. `none` disables the DHT."),
             ConfigField::list("bootstrap_peers", "Pinned peers")
                 .with_help("Multiaddrs this node keeps dialled (e.g. a known gateway)."),
+            ConfigField::list("gateway_urls", "Local gateways")
+                .with_help("Base URLs of gateways reached over HTTP without the swarm (e.g. http://metagateway-app:3000). They resolve NZB and subtitle pointers even when the libp2p link is down."),
             ConfigField::bool("enable_mdns", "LAN discovery (mDNS)"),
             ConfigField::bool("seed_dht_provide", "Announce seeds on the DHT")
                 .with_help("Publish provider records for what this node seeds, so remote peers can find it."),
@@ -68,6 +70,7 @@ pub fn seed() -> Value {
         "kad_namespace": env("KAD_NAMESPACE").unwrap_or_else(|| DEFAULT_NAMESPACE.to_string()),
         "kad_bootstrap_peers": env_list("KAD_BOOTSTRAP_PEERS"),
         "bootstrap_peers": env_list("BOOTSTRAP_PEERS"),
+        "gateway_urls": env_list("META_SHARE_GATEWAY_URLS"),
         "enable_mdns": env_flag("ENABLE_MDNS", true),
         "seed_dht_provide": env_flag("META_SHARE_SEED_DHT_PROVIDE", public),
         "max_conns": env_u64("META_SHARE_MAX_CONNS", 128),
@@ -92,6 +95,9 @@ pub fn env_overrides(v: &Value) -> Vec<(&'static str, String)> {
     }
     if let Some(l) = read::list(v, "bootstrap_peers").filter(|l| !l.is_empty()) {
         out.push(("BOOTSTRAP_PEERS", l.join(",")));
+    }
+    if let Some(l) = read::list(v, "gateway_urls").filter(|l| !l.is_empty()) {
+        out.push(("META_SHARE_GATEWAY_URLS", l.join(",")));
     }
     if let Some(b) = read::flag(v, "enable_mdns") {
         out.push(("ENABLE_MDNS", bool_s(b)));
