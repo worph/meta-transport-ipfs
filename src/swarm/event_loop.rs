@@ -28,6 +28,7 @@ use super::bitswap_client::BitswapInflight;
 use super::identify_agent::parse_base_url;
 use super::kad_discovery::{is_dialable_addr, namespace_key, peer_id_from_multiaddr, KadConfig};
 use super::peer_directory::PeerDirectory;
+use super::provide_queue::{ProvideQueue, DEFAULT_PROVIDE_CONCURRENCY};
 use super::{Behaviour, BehaviourEvent, Command, GatewayCapsConfig, PeersInfo};
 
 /// How often [`SwarmTask::on_gateway_keepalive_tick`] re-dials dropped
@@ -102,6 +103,8 @@ pub(super) struct SwarmTask {
     /// Gateways kept connected + routable by the keep-alive tick. See
     /// [`GatewayPin`].
     pinned_gateways: HashMap<PeerId, GatewayPin>,
+    /// Per-CID announcements waiting for a walk slot. See [`ProvideQueue`].
+    provides: ProvideQueue,
 }
 
 impl SwarmTask {
@@ -141,6 +144,12 @@ impl SwarmTask {
             http,
             gateway_caps,
             pinned_gateways: HashMap::new(),
+            provides: ProvideQueue::new(
+                std::env::var("META_SHARE_PROVIDE_CONCURRENCY")
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(DEFAULT_PROVIDE_CONCURRENCY),
+            ),
         }
     }
 
@@ -291,19 +300,39 @@ impl SwarmTask {
                 // Announce on the public IPFS DHT, keyed by the CID's
                 // multihash bytes — that's the kubo-compatible provider key,
                 // so a vanilla IPFS node `get_providers`ing the same content
-                // finds us. The StartProviding result is logged in
-                // `default_log`. Works in `Mode::Client` (same call the
-                // gateway makes).
+                // finds us. Queued, not fired: each announce is a DHT walk, and
+                // a burst of seeds must not become a burst of walks (see
+                // `provide_queue`). The StartProviding result is logged in
+                // `default_log`. Works in `Mode::Client`.
                 let key = RecordKey::new(&cid.hash().to_bytes());
-                match swarm.behaviour_mut().kad.start_providing(key) {
-                    Ok(qid) => debug!(?qid, %cid, "kad: providing seeded cid"),
-                    Err(e) => warn!(error = %e, %cid, "kad: start_providing(cid) failed"),
+                if self.provides.enqueue(key) {
+                    debug!(%cid, pending = self.provides.pending_len(),
+                        "kad: queued seeded cid for announce");
                 }
+                self.pump_provides(swarm);
             }
             Command::StopProviding { cid } => {
                 let key = RecordKey::new(&cid.hash().to_bytes());
+                self.provides.cancel(&key);
                 swarm.behaviour_mut().kad.stop_providing(&key);
                 debug!(%cid, "kad: stopped providing seeded cid");
+            }
+        }
+    }
+
+    /// Start queued announcements while walk slots are free.
+    fn pump_provides(&mut self, swarm: &mut Swarm<Behaviour>) {
+        while let Some(key) = self.provides.next_to_start() {
+            match swarm.behaviour_mut().kad.start_providing(key) {
+                Ok(qid) => {
+                    self.provides.started(qid);
+                    debug!(?qid, in_flight = self.provides.in_flight_len(),
+                        pending = self.provides.pending_len(), "kad: announcing seeded cid");
+                }
+                Err(e) => {
+                    self.provides.failed_to_start();
+                    warn!(error = %e, "kad: start_providing(cid) failed");
+                }
             }
         }
     }
@@ -565,6 +594,18 @@ impl SwarmTask {
             let fired = self.bitswap_inflight.on_event(ev);
             if fired {
                 trace!("bitswap: inflight query resolved");
+            }
+        }
+        // 2d) A queued announce finished (ok or timed out): free its slot and
+        //     start the next. Only on the query's last step — until then the
+        //     walk is still dialing.
+        if let SwarmEvent::Behaviour(BehaviourEvent::Kad(
+            kad::Event::OutboundQueryProgressed {
+                id, result: QueryResult::StartProviding(_), step, ..
+            }
+        )) = &event {
+            if step.last && self.provides.finished(*id) {
+                self.pump_provides(swarm);
             }
         }
         // 3) kad providers — dial each new peer-id (subject to soft ceiling).

@@ -128,6 +128,7 @@ mod event_loop;
 mod identify_agent;
 mod kad_discovery;
 mod peer_directory;
+mod provide_queue;
 
 pub use bitswap_client::bitswap_get_block;
 pub use identify_agent::build_agent_version;
